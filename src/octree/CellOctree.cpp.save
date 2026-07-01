@@ -1,0 +1,244 @@
+#include "oktal/octree/CellOctree.hpp"
+#include <sstream>
+#nodesStreamwinclude < algorithm>
+#include <iostream>
+#include <iterator>
+
+namespace oktal {
+
+namespace {
+[[nodiscard]] bool is_valid_char(char c) {
+  return c == 'R' || c == 'X' || c == '.' || c == 'P';
+}
+} // namespace
+
+void CellOctree::initialize_root() {
+  if (nodes_.empty()) {
+    level_start_indices_.push_back(0);
+    nodes_.emplace_back(false, false, 0);
+  }
+}
+
+// --- Geometry Methods (Cell Class) ---
+
+Vec3D CellOctree::Cell::center() const noexcept {
+  Box3D box = octree_->geometry_.cellBoundingBox(morton_index_);
+  Vec3D min = box.minCorner();
+  Vec3D max = box.maxCorner();
+  return min + (max - min) * 0.5;
+}
+
+Box3D CellOctree::Cell::boundingBox() const noexcept {
+  return octree_->geometry_.cellBoundingBox(morton_index_);
+}
+
+// --- Topology and Stream Methods ---
+
+CellOctree::size_type
+CellOctree::numberOfNodes(size_type level) const noexcept {
+  if (level >= numberOfLevels()) {
+    return 0;
+  }
+  const size_type start = level_start_indices_[level];
+  const size_type end = (level + 1 < numberOfLevels())
+                            ? level_start_indices_[level + 1]
+                            : nodes_.size();
+  return end - start;
+}
+
+std::span<const CellOctree::Node>
+CellOctree::nodesStream(size_type level) const noexcept {
+  if (level >= numberOfLevels()) {
+    return {};
+  }
+  const size_type start = level_start_indices_[level];
+  const size_type end = (level + 1 < numberOfLevels())
+                            ? level_start_indices_[level + 1]
+                            : nodes_.size();
+  return std::span<const CellOctree::Node>{nodes_.data() + start, end - start};
+}
+
+std::span<CellOctree::Node> CellOctree::nodesStream(size_type level,
+                                                    bool mutable_access) {
+  if (level >= numberOfLevels()) {
+    return {};
+  }
+  const size_type start = level_start_indices_[level];
+  const size_type end = (level + 1 < numberOfLevels())
+                            ? level_start_indices_[level + 1]
+                            : nodes_.size();
+  return std::span<CellOctree::Node>{nodes_.data() + start, end - start};
+}
+
+// --- Descriptor Parsing ---
+
+CellOctree CellOctree::fromDescriptor(std::string_view descr) {
+  return fromDescriptor(descr, OctreeGeometry(Vec3D(0.0), 1.0));
+}
+
+CellOctree CellOctree::fromDescriptor(std::string_view descr,
+                                      OctreeGeometry geometry) {
+  CellOctree octree(geometry);
+
+  octree.nodes_.clear();
+  octree.level_start_indices_.clear();
+
+  const std::string s(descr);
+  std::istringstream ss(s);
+  std::string segment;
+  size_type level = 0;
+
+  while (std::getline(ss, segment, '|')) {
+    const std::string_view level_descr(segment);
+    octree.level_start_indices_.push_back(octree.numberOfNodes());
+
+    if (level == 0) {
+      if (level_descr.size() != 1) {
+        throw std::invalid_argument("Root descriptor error");
+      }
+      if (!is_valid_char(level_descr[0])) {
+        throw std::invalid_argument("Invalid char");
+      }
+
+      const bool is_refined = (level_descr[0] == 'R' || level_descr[0] == 'X');
+      const bool is_phantom = (level_descr[0] == 'P' || level_descr[0] == 'X');
+
+      octree.nodes_.emplace_back(is_refined, is_phantom, 0);
+
+      if (octree.nodes_.back().isRefined() && !ss.good()) {
+        throw std::invalid_argument("Refined root needs children");
+      }
+    } else {
+      if (level_descr.empty()) {
+        break;
+      }
+
+      size_type expected_children = 0;
+      for (const auto &node : octree.nodesStream(level - 1)) {
+        if (node.isRefined()) {
+          expected_children += 8;
+        }
+      }
+
+      if (level_descr.size() != expected_children) {
+        throw std::invalid_argument("Incorrect number of children");
+      }
+
+      size_type next_children_start =
+          octree.numberOfNodes() + level_descr.size();
+      size_type current_children_index = octree.numberOfNodes();
+
+      // Pass 1: Create nodes
+      std::vector<size_type> refined_indices;
+      for (const char c : level_descr) {
+        if (!is_valid_char(c)) {
+          throw std::invalid_argument("Invalid char");
+        }
+
+        const bool is_refined = (c == 'R' || c == 'X');
+        const bool is_phantom = (c == 'P' || c == 'X');
+        octree.nodes_.emplace_back(is_refined, is_phantom, 0);
+        if (is_refined) {
+          refined_indices.push_back(octree.nodes_.size() - 1);
+        }
+      }
+
+      // Pass 2: Update parent links
+      size_type prev_level_end = octree.level_start_indices_[level];
+      size_type child_seg_start = current_children_index;
+
+      for (size_t i = octree.level_start_indices_[level - 1];
+           i < prev_level_end; ++i) {
+        if (octree.nodes_[i].isRefined()) {
+          octree.nodes_[i].setChildrenStartIndex(child_seg_start);
+          child_seg_start += 8;
+        }
+      }
+
+      // Pass 3: Update current refined nodes
+      for (const size_type node_idx : refined_indices) {
+        octree.nodes_[node_idx].setChildrenStartIndex(next_children_start);
+        next_children_start += 8;
+      }
+    }
+    level++;
+  }
+
+  if (octree.numberOfNodes() > 0 && octree.numberOfLevels() > 0) {
+    for (const auto &node : octree.nodesStream(octree.numberOfLevels() - 1)) {
+      if (node.isRefined()) {
+        throw std::invalid_argument("Incomplete descriptor");
+      }
+    }
+  }
+
+  return octree;
+}
+
+// --- Cell Queries ---
+
+std::pair<CellOctree::size_type, CellOctree::size_type>
+CellOctree::find_node(MortonIndex m) const noexcept {
+  if (m.level() >= numberOfLevels()) {
+    return {std::numeric_limits<size_type>::max(),
+            std::numeric_limits<size_type>::max()};
+  }
+  if (nodes_.empty() || nodes_[0].isPhantom()) {
+    if (m.isRoot()) {
+      return {std::numeric_limits<size_type>::max(),
+              std::numeric_limits<size_type>::max()};
+    }
+  }
+
+  size_type current_stream_idx = 0;
+
+  std::vector<size_type> path;
+  MortonIndex temp = m;
+  for (size_t k = 0; k < m.level(); ++k) {
+    path.push_back(temp.getBits() & 7);
+    temp = temp.parent();
+  }
+
+  for (size_t l = 0; l < m.level(); ++l) {
+    const Node &curr = nodes_[current_stream_idx];
+    if (!curr.isRefined()) {
+      return {std::numeric_limits<size_type>::max(),
+              std::numeric_limits<size_type>::max()};
+    }
+
+    size_type child_idx = path[m.level() - 1 - l];
+    current_stream_idx = curr.childrenStartIndex() + child_idx;
+  }
+
+  if (nodes_[current_stream_idx].isPhantom()) {
+    return {std::numeric_limits<size_type>::max(),
+            std::numeric_limits<size_type>::max()};
+  }
+
+  return {current_stream_idx, m.level()};
+}
+
+std::optional<CellOctree::Cell> CellOctree::getRootCell() const noexcept {
+  if (nodes_.empty() || nodes_[0].isPhantom()) {
+    return std::nullopt;
+  }
+  return Cell(this, 0, MortonIndex(0b1uz));
+}
+
+std::optional<CellOctree::Cell>
+CellOctree::getCell(MortonIndex m) const noexcept {
+  if (m.getBits() == 0b1uz) {
+    return getRootCell();
+  }
+  const auto [idx, lvl] = find_node(m);
+  if (idx != std::numeric_limits<size_type>::max()) {
+    return Cell(this, idx, m);
+  }
+  return std::nullopt;
+}
+
+bool CellOctree::cellExists(MortonIndex m) const noexcept {
+  return getCell(m).has_value();
+}
+
+} // namespace oktal
